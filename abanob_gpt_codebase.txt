@@ -1,0 +1,1910 @@
+===============================================================================
+ABANOB_GPT CODEBASE EXPORT
+Generated on: Mon Feb 23 10:05:47 PM UTC 2026
+===============================================================================
+
+-------------------------------------------------------------------------------
+FILE: shared/schema.ts
+-------------------------------------------------------------------------------
+import { pgTable, text, serial, integer, boolean, timestamp } from "drizzle-orm/pg-core";
+import { createInsertSchema } from "drizzle-zod";
+import { z } from "zod";
+
+import { pgTable, text, serial, integer, boolean, timestamp, varchar, index, jsonb } from "drizzle-orm/pg-core";
+import { createInsertSchema } from "drizzle-zod";
+import { z } from "zod";
+import { relations, sql } from "drizzle-orm";
+
+// Session storage table.
+// (IMPORTANT) This table is mandatory for Replit Auth, don't drop it.
+export const sessions = pgTable(
+  "sessions",
+  {
+    sid: varchar("sid").primaryKey(),
+    sess: jsonb("sess").notNull(),
+    expire: timestamp("expire").notNull(),
+  },
+  (table) => [index("IDX_session_expire").on(table.expire)]
+);
+
+// User storage table.
+// (IMPORTANT) This table is mandatory for Replit Auth, don't drop it.
+export const users = pgTable("users", {
+  id: varchar("id").primaryKey(),
+  email: varchar("email").unique(),
+  firstName: varchar("first_name"),
+  lastName: varchar("last_name"),
+  profileImageUrl: varchar("profile_image_url"),
+  createdAt: timestamp("created_at").defaultNow(),
+  updatedAt: timestamp("updated_at").defaultNow(),
+});
+
+export type UpsertUser = typeof users.$inferInsert;
+export type User = typeof users.$inferSelect;
+
+// Chat models
+export const conversations = pgTable("conversations", {
+  id: serial("id").primaryKey(),
+  title: text("title").notNull(),
+  userId: text("user_id"), // Revert to snake_case as it's the most common convention and matches storage.ts logic
+  createdAt: timestamp("created_at").default(sql`CURRENT_TIMESTAMP`).notNull(),
+});
+
+export const messages = pgTable("messages", {
+  id: serial("id").primaryKey(),
+  conversationId: integer("conversation_id").notNull().references(() => conversations.id, { onDelete: "cascade" }),
+  role: text("role").notNull(),
+  content: text("content").notNull(),
+  createdAt: timestamp("created_at").default(sql`CURRENT_TIMESTAMP`).notNull(),
+});
+
+export const insertConversationSchema = createInsertSchema(conversations).omit({
+  id: true,
+  createdAt: true,
+});
+
+export const insertMessageSchema = createInsertSchema(messages).omit({
+  id: true,
+  createdAt: true,
+});
+
+export type Conversation = typeof conversations.$inferSelect;
+export type InsertConversation = z.infer<typeof insertConversationSchema>;
+export type Message = typeof messages.$inferSelect;
+export type InsertMessage = z.infer<typeof insertMessageSchema>;
+
+
+-------------------------------------------------------------------------------
+FILE: server/index.ts
+-------------------------------------------------------------------------------
+import express, { type Request, Response, NextFunction } from "express";
+import { registerRoutes } from "./routes";
+import { serveStatic } from "./static";
+import { createServer } from "http";
+
+const app = express();
+const httpServer = createServer(app);
+
+declare module "http" {
+  interface IncomingMessage {
+    rawBody: unknown;
+  }
+}
+
+app.use(
+  express.json({
+    limit: "10mb",
+    verify: (req, _res, buf) => {
+      req.rawBody = buf;
+    },
+  }),
+);
+
+app.use(express.urlencoded({ extended: false, limit: "10mb" }));
+
+export function log(message: string, source = "express") {
+  const formattedTime = new Date().toLocaleTimeString("en-US", {
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: true,
+  });
+
+  console.log(`${formattedTime} [${source}] ${message}`);
+}
+
+app.use((req, res, next) => {
+  const start = Date.now();
+  const path = req.path;
+  let capturedJsonResponse: Record<string, any> | undefined = undefined;
+
+  const originalResJson = res.json;
+  res.json = function (bodyJson, ...args) {
+    capturedJsonResponse = bodyJson;
+    return originalResJson.apply(res, [bodyJson, ...args]);
+  };
+
+  res.on("finish", () => {
+    const duration = Date.now() - start;
+    if (path.startsWith("/api")) {
+      let logLine = `${req.method} ${path} ${res.statusCode} in ${duration}ms`;
+      if (capturedJsonResponse) {
+        logLine += ` :: ${JSON.stringify(capturedJsonResponse)}`;
+      }
+
+      log(logLine);
+    }
+  });
+
+  next();
+});
+
+(async () => {
+  await registerRoutes(httpServer, app);
+
+  app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
+    const status = err.status || err.statusCode || 500;
+    const message = err.message || "Internal Server Error";
+
+    res.status(status).json({ message });
+    throw err;
+  });
+
+  // importantly only setup vite in development and after
+  // setting up all the other routes so the catch-all route
+  // doesn't interfere with the other routes
+  if (process.env.NODE_ENV === "production") {
+    serveStatic(app);
+  } else {
+    const { setupVite } = await import("./vite");
+    await setupVite(httpServer, app);
+  }
+
+  // ALWAYS serve the app on the port specified in the environment variable PORT
+  // Other ports are firewalled. Default to 5000 if not specified.
+  // this serves both the API and the client.
+  // It is the only port that is not firewalled.
+  const port = parseInt(process.env.PORT || "5000", 10);
+  httpServer.listen(
+    {
+      port,
+      host: "0.0.0.0",
+      reusePort: true,
+    },
+    () => {
+      log(`serving on port ${port}`);
+    },
+  );
+})();
+
+
+-------------------------------------------------------------------------------
+FILE: server/routes.ts
+-------------------------------------------------------------------------------
+import type { Express } from "express";
+import { createServer, type Server } from "http";
+import { storage } from "./storage"; // Not used in the provided code, consider removing if unnecessary
+import { registerChatRoutes } from "./replit_integrations/chat";
+import { registerImageRoutes } from "./replit_integrations/image";
+import { setupAuth, registerAuthRoutes } from "./replit_integrations/auth";
+import multer from "multer";
+import * as pdfParseModule from "pdf-parse";
+import mammoth from "mammoth";
+import fs from "fs";
+
+// Fix for pdf-parse import in ESM
+const pdf = (pdfParseModule as any).default || pdfParseModule;
+
+if (!fs.existsSync("uploads")) {
+  fs.mkdirSync("uploads");
+}
+
+const upload = multer({ dest: "uploads/" });
+
+export async function registerRoutes(
+  httpServer: Server,
+  app: Express
+): Promise<Server> {
+  // Setup Auth FIRST
+  await setupAuth(app);
+  registerAuthRoutes(app);
+
+  // Register blueprint routes
+  registerChatRoutes(app);
+  registerImageRoutes(app);
+
+  // File processing route
+  app.post("/api/process-file", upload.single("file"), async (req, res) => {
+    try {
+      if (!req.file) {
+        return res.status(400).json({ message: "No file uploaded" });
+      }
+
+      const filePath = req.file.path;
+      const fileType = req.file.mimetype;
+      let content = "";
+
+      try {
+        if (fileType === "application/pdf") {
+          const dataBuffer = fs.readFileSync(filePath);
+          // Common issue with pdf-parse in ESM: it might be the default export or the named export.
+          // Let's handle all possibilities correctly.
+          let pdfFunc = pdfParseModule as any;
+          if (typeof pdfFunc !== 'function' && pdfFunc.default) {
+            pdfFunc = pdfFunc.default;
+          }
+          
+          if (typeof pdfFunc !== 'function') {
+            // Some versions of pdf-parse export the function directly as the module
+            throw new Error("pdf-parse is not a function. Module type: " + typeof pdfFunc);
+          }
+          
+          const data = await pdfFunc(dataBuffer);
+          content = data.text;
+        } else if (
+          fileType === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ||
+          fileType === "application/msword"
+        ) {
+          const result = await mammoth.extractRawText({ path: filePath });
+          content = result.value;
+        } else if (fileType.startsWith("text/") || fileType === "application/json" || fileType === "text/plain") {
+          content = fs.readFileSync(filePath, "utf-8");
+        } else {
+          return handleUnsupportedFileType(res, filePath, fileType);
+        }
+      } catch (err) {
+        console.error("Inner processing error:", err);
+        return handleCleanupAndError(res, filePath, err);
+      }
+
+      // Cleanup uploaded file
+      cleanupUploadedFile(filePath);
+      res.json({
+        content: content.trim(),
+        filename: req.file.originalname,
+        type: fileType,
+      });
+    } catch (error) {
+      console.error("File processing error:", error);
+      res.status(500).json({ 
+        message: "Failed to process file: " + (error instanceof Error ? error.message : "Unknown error") 
+      });
+    }
+  });
+
+  return httpServer;
+}
+
+// Helper functions
+function cleanupUploadedFile(filePath: string) {
+  if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+}
+
+function handleUnsupportedFileType(res: any, filePath: string, fileType: string) {
+  cleanupUploadedFile(filePath);
+  return res.status(400).json({ message: "Unsupported file type: " + fileType });
+}
+
+function handleCleanupAndError(res: any, filePath: string, error: any) {
+  cleanupUploadedFile(filePath);
+  return res.status(500).json({ 
+    message: "Processing error: " + (error instanceof Error ? error.message : "Unknown error") 
+  });
+}
+
+
+-------------------------------------------------------------------------------
+FILE: server/storage.ts
+-------------------------------------------------------------------------------
+import { users, type User, type InsertUser } from "@shared/schema";
+import { db } from "./db";
+import { eq } from "drizzle-orm";
+
+// We re-export chat storage for convenience if needed, 
+// but the blueprint routes use it directly from replit_integrations/chat/storage.
+// This file is mainly to satisfy the standard template structure and for any non-chat data.
+
+export interface IStorage {
+  getUser(id: number): Promise<User | undefined>;
+  getUserByUsername(username: string): Promise<User | undefined>;
+  createUser(user: InsertUser): Promise<User>;
+}
+
+export class DatabaseStorage implements IStorage {
+  async getUser(id: number): Promise<User | undefined> {
+    // We don't have a users table in schema yet (except the default one which I might have overwritten or not).
+    // The blueprint didn't add users, but shared/schema.ts exported * from models/chat.
+    // I should check if users table exists. 
+    // Assuming standard template users table might be gone if I overwrote schema.ts
+    // with "export * from ./models/chat".
+    // Let's check shared/schema.ts content in memory. 
+    // I overwrote it. So 'users' is NOT in schema.
+    // I should implement IStorage as empty or with dummy methods if no users table.
+    return undefined;
+  }
+
+  async getUserByUsername(username: string): Promise<User | undefined> {
+    return undefined;
+  }
+
+  async createUser(user: InsertUser): Promise<User> {
+    throw new Error("User creation not implemented");
+  }
+}
+
+export const storage = new DatabaseStorage();
+
+
+-------------------------------------------------------------------------------
+FILE: server/db.ts
+-------------------------------------------------------------------------------
+import { drizzle } from "drizzle-orm/node-postgres";
+import pg from "pg";
+import * as schema from "@shared/schema";
+
+const { Pool } = pg;
+
+if (!process.env.DATABASE_URL) {
+  throw new Error(
+    "DATABASE_URL must be set. Did you forget to provision a database?",
+  );
+}
+
+export const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+export const db = drizzle(pool, { schema });
+
+
+-------------------------------------------------------------------------------
+FILE: server/replit_integrations/chat/routes.ts
+-------------------------------------------------------------------------------
+import type { Express, Request, Response } from "express";
+import OpenAI from "openai";
+import { chatStorage } from "./storage";
+
+const openai = new OpenAI({
+  apiKey: process.env.AI_INTEGRATIONS_OPENAI_API_KEY,
+  baseURL: process.env.AI_INTEGRATIONS_OPENAI_BASE_URL,
+});
+
+export function registerChatRoutes(app: Express): void {
+  // Get all conversations
+  app.get("/api/conversations", async (req: Request, res: Response) => {
+    try {
+      const userId = (req as any).user?.claims?.sub || req.sessionID;
+      const conversations = await chatStorage.getAllConversations(userId);
+      res.json(conversations);
+    } catch (error) {
+      console.error("Error fetching conversations:", error);
+      res.status(500).json({ error: "Failed to fetch conversations" });
+    }
+  });
+
+  // Clear all conversations for current user
+  app.post("/api/conversations/clear", async (req: Request, res: Response) => {
+    try {
+      const userId = (req as any).user?.claims?.sub || req.sessionID;
+      if (userId) {
+        const conversations = await chatStorage.getAllConversations(userId);
+        for (const conv of conversations) {
+          await chatStorage.deleteConversation(conv.id, userId);
+        }
+      }
+      res.status(204).send();
+    } catch (error) {
+      console.error("Error clearing conversations:", error);
+      res.status(500).json({ error: "Failed to clear conversations" });
+    }
+  });
+
+  // Get single conversation with messages
+  app.get("/api/conversations/:id", async (req: Request, res: Response) => {
+    try {
+      const id = parseInt(req.params.id);
+      const userId = (req as any).user?.claims?.sub || req.sessionID;
+      const conversation = await chatStorage.getConversation(id, userId);
+      if (!conversation) {
+        return res.status(404).json({ error: "Conversation not found" });
+      }
+      const messages = await chatStorage.getMessagesByConversation(id, userId);
+      res.json({ ...conversation, messages });
+    } catch (error) {
+      console.error("Error fetching conversation:", error);
+      res.status(500).json({ error: "Failed to fetch conversation" });
+    }
+  });
+
+  // Create new conversation
+  app.post("/api/conversations", async (req: Request, res: Response) => {
+    try {
+      const { title } = req.body;
+      const userId = (req as any).user?.claims?.sub || req.sessionID;
+      const conversation = await chatStorage.createConversation(title || "New Chat", userId);
+      res.status(201).json(conversation);
+    } catch (error) {
+      console.error("Error creating conversation:", error);
+      res.status(500).json({ error: "Failed to create conversation" });
+    }
+  });
+
+  // Delete conversation
+  app.delete("/api/conversations/:id", async (req: Request, res: Response) => {
+    try {
+      const id = parseInt(req.params.id);
+      const userId = (req as any).user?.claims?.sub || req.sessionID;
+      await chatStorage.deleteConversation(id, userId);
+      res.status(204).send();
+    } catch (error) {
+      console.error("Error deleting conversation:", error);
+      res.status(500).json({ error: "Failed to delete conversation" });
+    }
+  });
+
+  // Send message and get AI response (streaming)
+  app.post("/api/conversations/:id/messages", async (req: Request, res: Response) => {
+    try {
+      const conversationId = parseInt(req.params.id);
+      const userId = (req as any).user?.claims?.sub || req.sessionID; // Support guest session ID
+      const { content, imageUrl } = req.body;
+
+      // Verify ownership
+      const conversation = await chatStorage.getConversation(conversationId, userId);
+      if (!conversation) {
+        return res.status(404).json({ error: "Conversation not found" });
+      }
+
+      // Save user message (including image if present)
+      const userMessageContent = imageUrl ? `${content}\n\n[Image: ${imageUrl}]` : content;
+      await chatStorage.createMessage(conversationId, "user", userMessageContent);
+
+      // Get conversation history for context
+      const messages = await chatStorage.getMessagesByConversation(conversationId, userId);
+      const chatMessages: any[] = messages.map((m) => {
+        // Simple heuristic to extract image URL from content if stored that way
+        const imageMatch = m.content.match(/\[Image: (.*?)\]/);
+        if (imageMatch) {
+          const textOnly = m.content.replace(/\[Image: (.*?)\]/, "").trim();
+          return {
+            role: m.role as "user" | "assistant",
+            content: [
+              { type: "text", text: textOnly || "Image uploaded" },
+              { type: "image_url", image_url: { url: imageMatch[1] } }
+            ]
+          };
+        }
+        return {
+          role: m.role as "user" | "assistant",
+          content: m.content,
+        };
+      });
+
+      // Set up SSE
+      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Cache-Control", "no-cache");
+      res.setHeader("Connection", "keep-alive");
+
+      // Stream response from OpenAI (using gpt-4o for best performance/vision)
+      const stream = await openai.chat.completions.create({
+        model: "gpt-4o",
+        messages: [
+          {
+            role: "system",
+            content: "You are abanob_gpt, a highly advanced AI assistant with capabilities similar to GPT-5. You can analyze images (JPG/PNG), process complex documents (PDF/TXT), and provide deeply reasoned answers. Use markdown for all responses. Always be helpful, precise, and professional. If an image is provided, focus your analysis on its content."
+          },
+          ...chatMessages
+        ],
+        stream: true,
+        max_tokens: 4096,
+      });
+
+      let fullResponse = "";
+
+      for await (const chunk of stream) {
+        const content = chunk.choices[0]?.delta?.content || "";
+        if (content) {
+          fullResponse += content;
+          res.write(`data: ${JSON.stringify({ content })}\n\n`);
+        }
+      }
+
+      // Save assistant message
+      await chatStorage.createMessage(conversationId, "assistant", fullResponse);
+
+      res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
+      res.end();
+    } catch (error) {
+      console.error("Error sending message:", error);
+      if (res.headersSent) {
+        res.write(`data: ${JSON.stringify({ error: "Failed to send message" })}\n\n`);
+        res.end();
+      } else {
+        res.status(500).json({ error: "Failed to send message" });
+      }
+    }
+  });
+}
+
+
+-------------------------------------------------------------------------------
+FILE: server/replit_integrations/chat/storage.ts
+-------------------------------------------------------------------------------
+import { db } from "../../db";
+import { conversations, messages } from "@shared/schema";
+import { eq, desc } from "drizzle-orm";
+
+export interface IChatStorage {
+  getConversation(id: number, userId?: string): Promise<typeof conversations.$inferSelect | undefined>;
+  getAllConversations(userId?: string): Promise<(typeof conversations.$inferSelect)[]>;
+  createConversation(title: string, userId?: string): Promise<typeof conversations.$inferSelect>;
+  deleteConversation(id: number, userId?: string): Promise<void>;
+  getMessagesByConversation(conversationId: number, userId?: string): Promise<(typeof messages.$inferSelect)[]>;
+  createMessage(conversationId: number, role: string, content: string): Promise<typeof messages.$inferSelect>;
+}
+
+export const chatStorage: IChatStorage = {
+  async getConversation(id: number, userId?: string) {
+    const query = db.select().from(conversations).where(eq(conversations.id, id));
+    if (userId) {
+      const [conversation] = await db.select().from(conversations).where(eq(conversations.id, id)).where(eq(conversations.userId, userId));
+      return conversation;
+    }
+    const [conversation] = await query;
+    return conversation;
+  },
+
+  async getAllConversations(userId?: string) {
+    if (userId) {
+      return db.select().from(conversations).where(eq(conversations.userId, userId)).orderBy(desc(conversations.createdAt));
+    }
+    return db.select().from(conversations).orderBy(desc(conversations.createdAt));
+  },
+
+  async createConversation(title: string, userId?: string) {
+    const [conversation] = await db.insert(conversations).values({ title, userId: userId || null }).returning();
+    return conversation;
+  },
+
+  async deleteConversation(id: number, userId?: string) {
+    if (userId) {
+      const conversation = await this.getConversation(id, userId);
+      if (!conversation) return;
+    }
+    await db.delete(messages).where(eq(messages.conversationId, id));
+    await db.delete(conversations).where(eq(conversations.id, id));
+  },
+
+  async getMessagesByConversation(conversationId: number, userId?: string) {
+    if (userId) {
+      const conversation = await this.getConversation(conversationId, userId);
+      if (!conversation) return [];
+    }
+    return db.select().from(messages).where(eq(messages.conversationId, conversationId)).orderBy(messages.createdAt);
+  },
+
+  async createMessage(conversationId: number, role: string, content: string) {
+    const [message] = await db.insert(messages).values({ conversationId, role, content }).returning();
+    return message;
+  },
+};
+
+
+
+-------------------------------------------------------------------------------
+FILE: server/replit_integrations/auth/replitAuth.ts
+-------------------------------------------------------------------------------
+import * as client from "openid-client";
+import { Strategy, type VerifyFunction } from "openid-client/passport";
+
+import passport from "passport";
+import session from "express-session";
+import type { Express, RequestHandler } from "express";
+import memoize from "memoizee";
+import connectPg from "connect-pg-simple";
+import { authStorage } from "./storage";
+import { pool } from "../../db";
+
+const getOidcConfig = memoize(
+  async () => {
+    return await client.discovery(
+      new URL(process.env.ISSUER_URL ?? "https://replit.com/oidc"),
+      process.env.REPL_ID!
+    );
+  },
+  { maxAge: 3600 * 1000 }
+);
+
+export function getSession() {
+  const sessionTtl = 60 * 60 * 1000; // 1 hour for ephemeral-like behavior
+  const pgStore = connectPg(session);
+  const sessionStore = new pgStore({
+    pool: pool,
+    createTableIfMissing: true,
+    ttl: sessionTtl / 1000,
+    tableName: "sessions",
+  });
+  return session({
+    secret: process.env.SESSION_SECRET!,
+    store: sessionStore,
+    resave: false,
+    saveUninitialized: true, // Allow session creation even without login for tracking
+    cookie: {
+      httpOnly: true,
+      secure: true,
+      maxAge: sessionTtl,
+    },
+  });
+}
+
+function updateUserSession(
+  user: any,
+  tokens: client.TokenEndpointResponse & client.TokenEndpointResponseHelpers
+) {
+  user.claims = tokens.claims();
+  user.access_token = tokens.access_token;
+  user.refresh_token = tokens.refresh_token;
+  user.expires_at = user.claims?.exp;
+}
+
+async function upsertUser(claims: any) {
+  await authStorage.upsertUser({
+    id: claims["sub"],
+    email: claims["email"],
+    firstName: claims["first_name"],
+    lastName: claims["last_name"],
+    profileImageUrl: claims["profile_image_url"],
+  });
+}
+
+export async function setupAuth(app: Express) {
+  app.set("trust proxy", 1);
+  app.use(getSession());
+  app.use(passport.initialize());
+  app.use(passport.session());
+
+  const config = await getOidcConfig();
+
+  const verify: VerifyFunction = async (
+    tokens: client.TokenEndpointResponse & client.TokenEndpointResponseHelpers,
+    verified: passport.AuthenticateCallback
+  ) => {
+    const user = {};
+    updateUserSession(user, tokens);
+    await upsertUser(tokens.claims());
+    verified(null, user);
+  };
+
+  // Keep track of registered strategies
+  const registeredStrategies = new Set<string>();
+
+  // Helper function to ensure strategy exists for a domain
+  const ensureStrategy = (domain: string) => {
+    const strategyName = `replitauth:${domain}`;
+    if (!registeredStrategies.has(strategyName)) {
+      const strategy = new Strategy(
+        {
+          name: strategyName,
+          config,
+          scope: "openid email profile offline_access",
+          callbackURL: `https://${domain}/api/callback`,
+        },
+        verify
+      );
+      passport.use(strategy);
+      registeredStrategies.add(strategyName);
+    }
+  };
+
+  passport.serializeUser((user: Express.User, cb) => cb(null, user));
+  passport.deserializeUser((user: Express.User, cb) => cb(null, user));
+
+  app.get("/api/login", (req, res, next) => {
+    ensureStrategy(req.hostname);
+    passport.authenticate(`replitauth:${req.hostname}`, {
+      prompt: "login consent",
+      scope: ["openid", "email", "profile", "offline_access"],
+    })(req, res, next);
+  });
+
+  app.get("/api/callback", (req, res, next) => {
+    ensureStrategy(req.hostname);
+    passport.authenticate(`replitauth:${req.hostname}`, {
+      successReturnToOrRedirect: "/",
+      failureRedirect: "/api/login",
+    })(req, res, next);
+  });
+
+  app.get("/api/logout", (req, res) => {
+    req.logout(() => {
+      res.redirect(
+        client.buildEndSessionUrl(config, {
+          client_id: process.env.REPL_ID!,
+          post_logout_redirect_uri: `${req.protocol}://${req.hostname}`,
+        }).href
+      );
+    });
+  });
+}
+
+export const isAuthenticated: RequestHandler = async (req, res, next) => {
+  const user = req.user as any;
+
+  if (!req.isAuthenticated() || !user.expires_at) {
+    return res.status(401).json({ message: "Unauthorized" });
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  if (now <= user.expires_at) {
+    return next();
+  }
+
+  const refreshToken = user.refresh_token;
+  if (!refreshToken) {
+    res.status(401).json({ message: "Unauthorized" });
+    return;
+  }
+
+  try {
+    const config = await getOidcConfig();
+    const tokenResponse = await client.refreshTokenGrant(config, refreshToken);
+    updateUserSession(user, tokenResponse);
+    return next();
+  } catch (error) {
+    res.status(401).json({ message: "Unauthorized" });
+    return;
+  }
+};
+
+
+-------------------------------------------------------------------------------
+FILE: client/src/App.tsx
+-------------------------------------------------------------------------------
+import { Switch, Route } from "wouter";
+import { queryClient } from "./lib/queryClient";
+import { QueryClientProvider } from "@tanstack/react-query";
+import { Toaster } from "@/components/ui/toaster";
+import { TooltipProvider } from "@/components/ui/tooltip";
+import Home from "@/pages/Home";
+import NotFound from "@/pages/not-found";
+import { useAuth } from "@/hooks/use-auth";
+import { Loader2 } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { useEffect } from "react";
+
+function LandingPage() {
+  return (
+    <div className="flex flex-col items-center justify-center min-h-screen bg-background p-4 text-center">
+      <h1 className="text-4xl font-bold mb-4">Welcome to abanob_gpt</h1>
+      <p className="text-muted-foreground mb-8 max-w-md">
+        Your private AI assistant. Log in to start a secure conversation.
+      </p>
+      <Button size="lg" onClick={() => (window.location.href = "/api/login")}>
+        Log in with Replit
+      </Button>
+    </div>
+  );
+}
+
+function Router() {
+  const { user, isLoading, isAuthenticated } = useAuth();
+
+  // If loading, show spinner
+  if (isLoading) {
+    return (
+      <div className="flex items-center justify-center min-h-screen">
+        <Loader2 className="h-8 w-8 animate-spin text-primary" />
+      </div>
+    );
+  }
+
+  // Allow guest access - no LandingPage redirect if not authenticated
+  return (
+    <Switch>
+      <Route path="/" component={Home} />
+      <Route component={NotFound} />
+    </Switch>
+  );
+}
+
+function App() {
+  return (
+    <QueryClientProvider client={queryClient}>
+      <TooltipProvider>
+        <Router />
+        <Toaster />
+      </TooltipProvider>
+    </QueryClientProvider>
+  );
+}
+
+export default App;
+
+
+-------------------------------------------------------------------------------
+FILE: client/src/pages/Home.tsx
+-------------------------------------------------------------------------------
+import { useState, useEffect } from "react";
+import { Sidebar } from "@/components/Sidebar";
+import { MessageList } from "@/components/MessageList";
+import { ChatInput } from "@/components/ChatInput";
+import { useConversations, useConversation, useCreateConversation, useDeleteConversation } from "@/hooks/use-chat";
+import { useToast } from "@/hooks/use-toast";
+import { Menu, Loader2 } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Sheet, SheetContent, SheetTrigger } from "@/components/ui/sheet";
+import { queryClient } from "@/lib/queryClient";
+import { useAuth } from "@/hooks/use-auth";
+
+export default function Home() {
+  const [activeId, setActiveId] = useState<number | null>(null);
+  const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+  const [streamingContent, setStreamingContent] = useState("");
+  const [isStreaming, setIsStreaming] = useState(false);
+
+  const { data: conversations = [], isLoading: loadingConversations } = useConversations();
+  const { data: conversation, isLoading: loadingMessages } = useConversation(activeId);
+  
+  const createMutation = useCreateConversation();
+  const deleteMutation = useDeleteConversation();
+  const { user } = useAuth();
+  const { toast } = useToast();
+
+  useEffect(() => {
+    // Clear chat history when the tab/window is closed or navigated away
+    const handleUnload = () => {
+      // Use sendBeacon for reliable delivery on unload
+      navigator.sendBeacon("/api/conversations/clear");
+    };
+    
+    window.addEventListener("pagehide", handleUnload);
+    return () => window.removeEventListener("pagehide", handleUnload);
+  }, []);
+
+  // Select most recent conversation on load if none selected
+  useEffect(() => {
+    if (!activeId && conversations.length > 0 && !loadingConversations) {
+      setActiveId(conversations[0].id);
+    }
+  }, [conversations, activeId, loadingConversations]);
+
+  const handleNewChat = () => {
+    createMutation.mutate("New Chat", {
+      onSuccess: (newChat) => {
+        setActiveId(newChat.id);
+        setIsSidebarOpen(false);
+      },
+      onError: () => {
+        toast({ title: "Error", description: "Failed to create chat", variant: "destructive" });
+      }
+    });
+  };
+
+  const handleDeleteChat = (id: number) => {
+    deleteMutation.mutate(id, {
+      onSuccess: () => {
+        if (activeId === id) {
+          setActiveId(null);
+        }
+        toast({ title: "Chat deleted" });
+      },
+    });
+  };
+
+  const handleSendMessage = async (content: string, imageUrl?: string) => {
+    if (!activeId) return;
+
+    setIsStreaming(true);
+    setStreamingContent("");
+
+    try {
+      const res = await fetch(`/api/conversations/${activeId}/messages`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content, imageUrl }),
+      });
+
+      if (!res.ok) throw new Error("Failed to send message");
+
+      const reader = res.body?.getReader();
+      const decoder = new TextDecoder();
+
+      if (!reader) throw new Error("No reader available");
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        const chunk = decoder.decode(value);
+        const lines = chunk.split("\n");
+
+        for (const line of lines) {
+          if (line.startsWith("data: ")) {
+            try {
+              const data = JSON.parse(line.slice(6));
+              if (data.done) {
+                // Refresh messages to show the full saved history
+                queryClient.invalidateQueries({ queryKey: [`/api/conversations/${activeId}`] });
+              } else if (data.content) {
+                setStreamingContent((prev) => prev + data.content);
+              }
+            } catch (e) {
+              console.error("Error parsing SSE data", e);
+            }
+          }
+        }
+      }
+    } catch (err) {
+      console.error(err);
+      toast({ title: "Error", description: "Failed to send message", variant: "destructive" });
+    } finally {
+      setIsStreaming(false);
+      setStreamingContent("");
+    }
+  };
+
+  return (
+    <div className="flex h-screen bg-background text-foreground overflow-hidden">
+      {/* Mobile Sidebar */}
+      <div className="md:hidden absolute top-4 left-4 z-50">
+        <Sheet open={isSidebarOpen} onOpenChange={setIsSidebarOpen}>
+          <SheetTrigger asChild>
+            <Button variant="outline" size="icon" className="shadow-md bg-background/80 backdrop-blur-md">
+              <Menu className="w-5 h-5" />
+            </Button>
+          </SheetTrigger>
+          <SheetContent side="left" className="p-0 w-72">
+            <Sidebar
+              conversations={conversations}
+              activeId={activeId}
+              onSelect={(id) => {
+                setActiveId(id);
+                setIsSidebarOpen(false);
+              }}
+              onNew={handleNewChat}
+              onDelete={handleDeleteChat}
+              isLoading={loadingConversations}
+            />
+          </SheetContent>
+        </Sheet>
+      </div>
+
+      {/* Desktop Sidebar */}
+      <div className="hidden md:block w-72 h-full shrink-0">
+        <Sidebar
+          conversations={conversations}
+          activeId={activeId}
+          onSelect={setActiveId}
+          onNew={handleNewChat}
+          onDelete={handleDeleteChat}
+          isLoading={loadingConversations}
+        />
+      </div>
+
+      {/* Main Chat Area */}
+      <div className="flex-1 flex flex-col h-full relative w-full max-w-full">
+        {activeId ? (
+          <>
+            <div className="h-14 border-b border-border/40 flex items-center px-6 md:px-8 bg-background/50 backdrop-blur-sm z-10 shrink-0">
+               <h2 className="font-semibold text-sm text-foreground/80 truncate">
+                 {conversation?.title || "Chat"}
+               </h2>
+            </div>
+            
+            <MessageList 
+              messages={conversation?.messages || []} 
+              isLoading={isStreaming} 
+              streamingContent={streamingContent}
+            />
+            
+            <ChatInput 
+              onSend={handleSendMessage} 
+              disabled={isStreaming || loadingMessages}
+            />
+          </>
+        ) : (
+          <div className="flex-1 flex flex-col items-center justify-center p-8 text-center space-y-6">
+            <div className="w-24 h-24 bg-primary/10 rounded-3xl flex items-center justify-center mb-4">
+              <Loader2 className="w-10 h-10 text-primary animate-spin" />
+            </div>
+            <div>
+              <h1 className="text-2xl font-bold mb-2">Welcome to abanob_gpt</h1>
+              <p className="text-muted-foreground max-w-md mx-auto">
+                Create a new chat or select an existing conversation to get started.
+                You can upload documents to analyze them.
+              </p>
+            </div>
+            <Button onClick={handleNewChat} size="lg" className="shadow-lg shadow-primary/20">
+              Start a New Conversation
+            </Button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+
+-------------------------------------------------------------------------------
+FILE: client/src/components/ChatInput.tsx
+-------------------------------------------------------------------------------
+import { useState, useRef } from "react";
+import { Button } from "@/components/ui/button";
+import { Textarea } from "@/components/ui/textarea"; // Need to create this if not standard, sticking to basic for now
+import { Paperclip, Send, X, FileText, Loader2 } from "lucide-react";
+import { useProcessFile } from "@/hooks/use-file";
+import { useToast } from "@/hooks/use-toast";
+import { motion, AnimatePresence } from "framer-motion";
+import { cn } from "@/lib/utils";
+
+interface ChatInputProps {
+  onSend: (message: string, imageUrl?: string) => void;
+  disabled?: boolean;
+}
+
+export function ChatInput({ onSend, disabled }: ChatInputProps) {
+  const [message, setMessage] = useState("");
+  const [attachment, setAttachment] = useState<{ name: string; content: string; isImage?: boolean } | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const { mutate: processFile, isPending: isUploading } = useProcessFile();
+  const { toast } = useToast();
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    // Validate size (e.g. 5MB)
+    if (file.size > 5 * 1024 * 1024) {
+      toast({
+        title: "File too large",
+        description: "Please upload a file smaller than 5MB",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    if (file.type.startsWith("image/")) {
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        const content = e.target?.result as string;
+        setAttachment({ name: file.name, content: content, isImage: true });
+        toast({ title: "Image added", description: `${file.name} ready to analyze` });
+      };
+      reader.readAsDataURL(file);
+    } else {
+      processFile(file, {
+        onSuccess: (data) => {
+          setAttachment({ name: data.filename, content: data.content, isImage: false });
+          toast({ title: "File processed", description: `${data.filename} ready to analyze` });
+        },
+        onError: (err) => {
+          console.error("File upload error:", err);
+          toast({
+            title: "Upload failed",
+            description: "Failed to upload file. Please try again.",
+            variant: "destructive",
+          });
+        },
+      });
+    }
+
+    // Reset input
+    e.target.value = "";
+  };
+
+  const handleSend = () => {
+    if ((!message.trim() && !attachment) || disabled || isUploading) return;
+
+    if (attachment?.isImage) {
+      onSend(message, attachment.content);
+    } else {
+      let finalMessage = message;
+      if (attachment) {
+        finalMessage = `[Attachment: ${attachment.name}]\n${attachment.content}\n\nUser Question: ${message}`;
+      }
+      onSend(finalMessage);
+    }
+    
+    setMessage("");
+    setAttachment(null);
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      handleSend();
+    }
+  };
+
+  return (
+    <div className="p-4 md:p-6 bg-background/80 backdrop-blur-lg border-t border-border/40">
+      <div className="max-w-3xl mx-auto relative">
+        <AnimatePresence>
+          {attachment && (
+            <motion.div
+              initial={{ opacity: 0, y: 10 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: 10 }}
+              className="absolute -top-14 left-0 flex items-center gap-2 bg-secondary/80 text-secondary-foreground px-3 py-2 rounded-lg text-sm border border-border/50 shadow-sm"
+            >
+              <FileText className="w-4 h-4 text-primary" />
+              <span className="font-medium truncate max-w-[200px]">{attachment.name}</span>
+              <button
+                onClick={() => setAttachment(null)}
+                className="ml-2 hover:bg-black/10 rounded-full p-0.5 transition-colors"
+              >
+                <X className="w-3 h-3" />
+              </button>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        <div className={cn(
+          "flex gap-3 items-end bg-muted/40 p-2 rounded-2xl border border-border/50 transition-all focus-within:ring-2 focus-within:ring-primary/20 focus-within:border-primary",
+          isUploading && "opacity-80 pointer-events-none"
+        )}>
+          <input
+            type="file"
+            ref={fileInputRef}
+            className="hidden"
+            accept=".txt,.md,.json,.csv,.pdf,image/*" 
+            onChange={handleFileChange}
+          />
+          
+          <Button
+            variant="ghost"
+            size="icon"
+            className="rounded-xl shrink-0 text-muted-foreground hover:text-primary hover:bg-primary/10 h-10 w-10"
+            onClick={() => fileInputRef.current?.click()}
+            disabled={isUploading || !!attachment}
+          >
+            {isUploading ? (
+              <Loader2 className="w-5 h-5 animate-spin" />
+            ) : (
+              <Paperclip className="w-5 h-5" />
+            )}
+          </Button>
+
+          <textarea
+            value={message}
+            onChange={(e) => setMessage(e.target.value)}
+            onKeyDown={handleKeyDown}
+            placeholder={isUploading ? "Processing file..." : "Ask a question..."}
+            className="flex-1 bg-transparent border-0 focus:ring-0 resize-none max-h-[120px] min-h-[44px] py-2.5 px-2 text-sm md:text-base scrollbar-thin scrollbar-thumb-muted-foreground/20"
+            disabled={disabled || isUploading}
+            rows={1}
+            style={{ height: 'auto', overflow: 'hidden' }}
+            onInput={(e) => {
+              const target = e.target as HTMLTextAreaElement;
+              target.style.height = 'auto';
+              target.style.height = `${Math.min(target.scrollHeight, 120)}px`;
+            }}
+          />
+
+          <Button 
+            onClick={handleSend}
+            disabled={(!message.trim() && !attachment) || disabled || isUploading}
+            className={cn(
+              "rounded-xl h-10 w-10 shrink-0 transition-all",
+              message.trim() || attachment ? "bg-primary shadow-md shadow-primary/25" : "bg-muted text-muted-foreground hover:bg-muted"
+            )}
+            size="icon"
+          >
+            <Send className="w-4 h-4" />
+          </Button>
+        </div>
+        
+        <div className="text-center mt-2">
+           <p className="text-[10px] text-muted-foreground/60 font-medium">
+             AI can make mistakes. Verify important information.
+           </p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+-------------------------------------------------------------------------------
+FILE: client/src/components/MessageList.tsx
+-------------------------------------------------------------------------------
+import { useEffect, useRef } from "react";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import { cn } from "@/lib/utils";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import { Bot, User } from "lucide-react";
+import { motion, AnimatePresence } from "framer-motion";
+import type { Message } from "@shared/models/chat";
+
+interface MessageListProps {
+  messages: Message[];
+  isLoading?: boolean;
+  streamingContent?: string;
+}
+
+export function MessageList({ messages, isLoading, streamingContent }: MessageListProps) {
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const bottomRef = useRef<HTMLDivElement>(null);
+
+  // Auto-scroll to bottom
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages, streamingContent]);
+
+  const allMessages = [...messages];
+  if (streamingContent) {
+    allMessages.push({
+      id: -1,
+      role: "assistant",
+      content: streamingContent,
+      conversationId: -1,
+      createdAt: new Date(),
+    });
+  }
+
+  return (
+    <ScrollArea ref={scrollRef} className="flex-1 px-4 md:px-8 py-6">
+      <div className="max-w-3xl mx-auto space-y-8 pb-12">
+        <AnimatePresence initial={false}>
+          {allMessages.map((msg, index) => (
+            <motion.div
+              key={msg.id === -1 ? `streaming-${index}` : msg.id}
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ duration: 0.3 }}
+              className={cn(
+                "flex gap-4 md:gap-6",
+                msg.role === "user" ? "flex-row-reverse" : "flex-row"
+              )}
+            >
+              {/* Avatar */}
+              <div
+                className={cn(
+                  "w-8 h-8 md:w-10 md:h-10 rounded-xl flex items-center justify-center shrink-0 shadow-sm",
+                  msg.role === "assistant"
+                    ? "bg-primary text-primary-foreground"
+                    : "bg-muted text-muted-foreground"
+                )}
+              >
+                {msg.role === "assistant" ? (
+                  <Bot className="w-5 h-5 md:w-6 md:h-6" />
+                ) : (
+                  <User className="w-5 h-5 md:w-6 md:h-6" />
+                )}
+              </div>
+
+              {/* Bubble */}
+              <div
+                className={cn(
+                  "relative max-w-[85%] rounded-2xl px-5 py-4 shadow-sm",
+                  msg.role === "user"
+                    ? "bg-primary text-primary-foreground rounded-tr-sm"
+                    : "bg-card border border-border/50 text-foreground rounded-tl-sm"
+                )}
+              >
+                <div className={cn("prose prose-sm md:prose-base max-w-none break-words", msg.role === "user" ? "text-white prose-invert" : "text-foreground")}>
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                    {msg.content}
+                  </ReactMarkdown>
+                </div>
+              </div>
+            </motion.div>
+          ))}
+        </AnimatePresence>
+        
+        {isLoading && !streamingContent && (
+          <div className="flex gap-4 items-center">
+             <div className="w-10 h-10 rounded-xl bg-primary/10 flex items-center justify-center shrink-0">
+               <Bot className="w-6 h-6 text-primary animate-pulse" />
+             </div>
+             <div className="flex flex-col gap-1">
+               <span className="text-xs font-semibold text-primary/70">abanob_gpt is thinking...</span>
+               <div className="flex gap-1">
+                 <span className="w-2 h-2 bg-primary/40 rounded-full animate-bounce [animation-delay:-0.3s]"></span>
+                 <span className="w-2 h-2 bg-primary/40 rounded-full animate-bounce [animation-delay:-0.15s]"></span>
+                 <span className="w-2 h-2 bg-primary/40 rounded-full animate-bounce"></span>
+               </div>
+             </div>
+          </div>
+        )}
+        <div ref={bottomRef} className="h-1" />
+      </div>
+    </ScrollArea>
+  );
+}
+
+
+-------------------------------------------------------------------------------
+FILE: client/src/components/Sidebar.tsx
+-------------------------------------------------------------------------------
+import { ScrollArea } from "@/components/ui/scroll-area";
+import { Button } from "@/components/ui/button";
+import { Plus, MessageSquare, Trash2, Bot, LogOut } from "lucide-react";
+import { cn } from "@/lib/utils";
+import type { Conversation } from "@shared/schema";
+import { useAuth } from "@/hooks/use-auth";
+
+interface SidebarProps {
+  conversations: Conversation[];
+  activeId: number | null;
+  onSelect: (id: number) => void;
+  onNew: () => void;
+  onDelete: (id: number) => void;
+  isLoading?: boolean;
+}
+
+export function Sidebar({ 
+  conversations, 
+  activeId, 
+  onSelect, 
+  onNew, 
+  onDelete,
+  isLoading 
+}: SidebarProps) {
+  const { isAuthenticated, user } = useAuth();
+
+  return (
+    <div className="flex flex-col h-full bg-muted/30 border-r border-border/40 backdrop-blur-xl">
+      <div className="p-4 border-b border-border/40">
+        <div className="flex items-center gap-2 mb-6 px-2">
+          <div className="w-8 h-8 rounded-xl bg-primary/10 flex items-center justify-center text-primary">
+            <Bot className="w-5 h-5" />
+          </div>
+          <span className="font-bold text-lg tracking-tight">abanob_gpt</span>
+          {isAuthenticated ? (
+            <span className="ml-auto text-[10px] bg-primary/10 text-primary px-2 py-0.5 rounded-full font-medium">
+              Member
+            </span>
+          ) : (
+            <span className="ml-auto text-[10px] bg-muted text-muted-foreground px-2 py-0.5 rounded-full font-medium">
+              Guest
+            </span>
+          )}
+        </div>
+        <Button 
+          onClick={onNew} 
+          className="w-full justify-start gap-2 shadow-sm font-semibold"
+          size="lg"
+        >
+          <Plus className="w-4 h-4" />
+          New Chat
+        </Button>
+      </div>
+
+      <ScrollArea className="flex-1 px-3 py-4">
+        <div className="space-y-1">
+          {isLoading ? (
+            <div className="px-4 py-8 text-center text-muted-foreground text-sm">
+              Loading history...
+            </div>
+          ) : conversations.length === 0 ? (
+            <div className="px-4 py-8 text-center text-muted-foreground text-sm">
+              No recent chats
+            </div>
+          ) : (
+            conversations.map((chat) => (
+              <div
+                key={chat.id}
+                className="group relative flex items-center"
+              >
+                <button
+                  onClick={() => onSelect(chat.id)}
+                  className={cn(
+                    "w-full flex items-center gap-3 px-3 py-3 rounded-lg text-sm transition-all duration-200 text-left",
+                    activeId === chat.id 
+                      ? "bg-primary/10 text-primary font-medium" 
+                      : "text-muted-foreground hover:bg-accent hover:text-foreground"
+                  )}
+                >
+                  <MessageSquare className="w-4 h-4 shrink-0" />
+                  <span className="truncate pr-8">{chat.title}</span>
+                </button>
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onDelete(chat.id);
+                  }}
+                  className={cn(
+                    "absolute right-2 p-1.5 rounded-md opacity-0 group-hover:opacity-100 transition-opacity",
+                    "text-muted-foreground hover:text-destructive hover:bg-destructive/10"
+                  )}
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            ))
+          )}
+        </div>
+      </ScrollArea>
+
+      <div className="p-4 border-t border-border/40 mt-auto flex flex-col gap-2">
+        {isAuthenticated ? (
+          <Button 
+            variant="ghost" 
+            className="w-full justify-start gap-2 text-muted-foreground hover:text-foreground"
+            onClick={() => window.location.href = "/api/logout"}
+          >
+            <LogOut className="w-4 h-4" />
+            Log out ({user?.firstName || 'User'})
+          </Button>
+        ) : (
+          <div className="flex flex-col gap-2">
+            <div className="px-3 py-2 text-[10px] uppercase font-bold text-muted-foreground tracking-wider">
+              Guest Mode Active
+            </div>
+            <Button 
+              variant="outline" 
+              className="w-full justify-start gap-2"
+              onClick={() => window.location.href = "/api/login"}
+            >
+              <LogOut className="w-4 h-4 rotate-180" />
+              Sign in for Permanent History
+            </Button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+
+-------------------------------------------------------------------------------
+FILE: client/src/hooks/use-chat.ts
+-------------------------------------------------------------------------------
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { type Conversation, type Message } from "@shared/models/chat";
+import { apiRequest } from "@/lib/queryClient";
+
+// Fetch all conversations
+export function useConversations() {
+  return useQuery({
+    queryKey: ["/api/conversations"],
+    queryFn: async () => {
+      const res = await apiRequest("GET", "/api/conversations");
+      return res.json() as Promise<Conversation[]>;
+    },
+  });
+}
+
+// Fetch a single conversation with its messages
+export function useConversation(id: number | null) {
+  return useQuery({
+    queryKey: [`/api/conversations/${id}`],
+    enabled: !!id,
+    queryFn: async () => {
+      const res = await apiRequest("GET", `/api/conversations/${id}`);
+      return res.json() as Promise<Conversation & { messages: Message[] }>;
+    },
+  });
+}
+
+// Create a new conversation
+export function useCreateConversation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (title: string = "New Chat") => {
+      const res = await apiRequest("POST", "/api/conversations", { title });
+      return res.json() as Promise<Conversation>;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["/api/conversations"] });
+    },
+  });
+}
+
+// Delete a conversation
+export function useDeleteConversation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (id: number) => {
+      await apiRequest("DELETE", `/api/conversations/${id}`);
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["/api/conversations"] });
+    },
+  });
+}
+
+
+-------------------------------------------------------------------------------
+FILE: client/src/hooks/use-auth.ts
+-------------------------------------------------------------------------------
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import type { User } from "@shared/schema";
+
+async function fetchUser(): Promise<User | null> {
+  const response = await fetch("/api/auth/user", {
+    credentials: "include",
+  });
+
+  if (response.status === 401) {
+    return null;
+  }
+
+  if (!response.ok) {
+    throw new Error(`${response.status}: ${response.statusText}`);
+  }
+
+  return response.json();
+}
+
+async function logout(): Promise<void> {
+  window.location.href = "/api/logout";
+}
+
+export function useAuth() {
+  const queryClient = useQueryClient();
+  const { data: user, isLoading } = useQuery<User | null>({
+    queryKey: ["/api/auth/user"],
+    queryFn: fetchUser,
+    retry: false,
+    staleTime: 1000 * 60 * 5, // 5 minutes
+  });
+
+  const logoutMutation = useMutation({
+    mutationFn: logout,
+    onSuccess: () => {
+      queryClient.setQueryData(["/api/auth/user"], null);
+    },
+  });
+
+  return {
+    user,
+    isLoading,
+    isAuthenticated: !!user,
+    logout: logoutMutation.mutate,
+    isLoggingOut: logoutMutation.isPending,
+  };
+}
+
+
+-------------------------------------------------------------------------------
+FILE: client/src/hooks/use-file.ts
+-------------------------------------------------------------------------------
+import { useMutation } from "@tanstack/react-query";
+
+interface ProcessFileResponse {
+  content: string;
+  filename: string;
+  type: string;
+}
+
+export function useProcessFile() {
+  return useMutation({
+    mutationFn: async (file: File) => {
+      const formData = new FormData();
+      formData.append("file", file);
+
+      // Note: We use fetch directly here because apiRequest handles JSON by default,
+      // but here we need to send FormData without Content-Type header (browser sets it)
+      const res = await fetch("/api/process-file", {
+        method: "POST",
+        body: formData,
+        credentials: "include",
+      });
+
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(text || "Failed to upload file");
+      }
+
+      return res.json() as Promise<ProcessFileResponse>;
+    },
+  });
+}
+
+
+-------------------------------------------------------------------------------
+FILE: package.json
+-------------------------------------------------------------------------------
+{
+  "name": "rest-express",
+  "version": "1.0.0",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "dev": "NODE_ENV=development tsx server/index.ts",
+    "build": "tsx script/build.ts",
+    "start": "NODE_ENV=production node dist/index.cjs",
+    "check": "tsc",
+    "db:push": "drizzle-kit push"
+  },
+  "dependencies": {
+    "@hookform/resolvers": "^3.10.0",
+    "@jridgewell/trace-mapping": "^0.3.25",
+    "@radix-ui/react-accordion": "^1.2.4",
+    "@radix-ui/react-alert-dialog": "^1.1.7",
+    "@radix-ui/react-aspect-ratio": "^1.1.3",
+    "@radix-ui/react-avatar": "^1.1.4",
+    "@radix-ui/react-checkbox": "^1.1.5",
+    "@radix-ui/react-collapsible": "^1.1.4",
+    "@radix-ui/react-context-menu": "^2.2.7",
+    "@radix-ui/react-dialog": "^1.1.7",
+    "@radix-ui/react-dropdown-menu": "^2.1.7",
+    "@radix-ui/react-hover-card": "^1.1.7",
+    "@radix-ui/react-label": "^2.1.3",
+    "@radix-ui/react-menubar": "^1.1.7",
+    "@radix-ui/react-navigation-menu": "^1.2.6",
+    "@radix-ui/react-popover": "^1.1.7",
+    "@radix-ui/react-progress": "^1.1.3",
+    "@radix-ui/react-radio-group": "^1.2.4",
+    "@radix-ui/react-scroll-area": "^1.2.4",
+    "@radix-ui/react-select": "^2.1.7",
+    "@radix-ui/react-separator": "^1.1.3",
+    "@radix-ui/react-slider": "^1.2.4",
+    "@radix-ui/react-slot": "^1.2.0",
+    "@radix-ui/react-switch": "^1.1.4",
+    "@radix-ui/react-tabs": "^1.1.4",
+    "@radix-ui/react-toast": "^1.2.7",
+    "@radix-ui/react-toggle": "^1.1.3",
+    "@radix-ui/react-toggle-group": "^1.1.3",
+    "@radix-ui/react-tooltip": "^1.2.0",
+    "@tanstack/react-query": "^5.60.5",
+    "@types/memoizee": "^0.4.12",
+    "@types/multer": "^2.0.0",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "cmdk": "^1.1.1",
+    "connect-pg-simple": "^10.0.0",
+    "date-fns": "^3.6.0",
+    "drizzle-orm": "^0.39.3",
+    "drizzle-zod": "^0.7.1",
+    "embla-carousel-react": "^8.6.0",
+    "express": "^4.21.2",
+    "express-session": "^1.18.2",
+    "framer-motion": "^11.18.2",
+    "input-otp": "^1.4.2",
+    "lucide-react": "^0.453.0",
+    "mammoth": "^1.11.0",
+    "memoizee": "^0.4.17",
+    "memorystore": "^1.6.7",
+    "multer": "^2.0.2",
+    "next-themes": "^0.4.6",
+    "openai": "^6.16.0",
+    "openid-client": "^6.8.1",
+    "p-limit": "^7.2.0",
+    "p-retry": "^7.1.1",
+    "passport": "^0.7.0",
+    "passport-local": "^1.0.0",
+    "pdf-parse": "^2.4.5",
+    "pg": "^8.16.3",
+    "react": "^18.3.1",
+    "react-day-picker": "^8.10.1",
+    "react-dom": "^18.3.1",
+    "react-hook-form": "^7.55.0",
+    "react-icons": "^5.4.0",
+    "react-markdown": "^10.1.0",
+    "react-resizable-panels": "^2.1.7",
+    "recharts": "^2.15.2",
+    "remark-gfm": "^4.0.1",
+    "tailwind-merge": "^2.6.0",
+    "tailwindcss-animate": "^1.0.7",
+    "tw-animate-css": "^1.2.5",
+    "vaul": "^1.1.2",
+    "wouter": "^3.3.5",
+    "ws": "^8.18.0",
+    "zod": "^3.25.76",
+    "zod-validation-error": "^3.5.4"
+  },
+  "devDependencies": {
+    "@replit/vite-plugin-cartographer": "^0.4.4",
+    "@replit/vite-plugin-dev-banner": "^0.1.1",
+    "@replit/vite-plugin-runtime-error-modal": "^0.0.3",
+    "@tailwindcss/typography": "^0.5.15",
+    "@tailwindcss/vite": "^4.1.18",
+    "@types/connect-pg-simple": "^7.0.3",
+    "@types/express": "4.17.21",
+    "@types/express-session": "^1.18.2",
+    "@types/node": "20.19.27",
+    "@types/passport": "^1.0.17",
+    "@types/passport-local": "^1.0.38",
+    "@types/react": "^18.3.11",
+    "@types/react-dom": "^18.3.1",
+    "@types/ws": "^8.5.13",
+    "@vitejs/plugin-react": "^4.7.0",
+    "autoprefixer": "^10.4.20",
+    "drizzle-kit": "^0.31.8",
+    "esbuild": "^0.25.0",
+    "postcss": "^8.4.47",
+    "tailwindcss": "^3.4.17",
+    "tsx": "^4.20.5",
+    "typescript": "5.6.3",
+    "vite": "^7.3.0"
+  },
+  "overrides": {
+    "drizzle-kit": {
+      "@esbuild-kit/esm-loader": "npm:tsx@^4.20.4"
+    }
+  },
+  "optionalDependencies": {
+    "bufferutil": "^4.0.8"
+  }
+}
+
+
+-------------------------------------------------------------------------------
+FILE: tsconfig.json
+-------------------------------------------------------------------------------
+{
+  "include": ["client/src/**/*", "shared/**/*", "server/**/*"],
+  "exclude": ["node_modules", "build", "dist", "**/*.test.ts"],
+  "compilerOptions": {
+    "incremental": true,
+    "tsBuildInfoFile": "./node_modules/typescript/tsbuildinfo",
+    "noEmit": true,
+    "module": "ESNext",
+    "strict": true,
+    "lib": ["esnext", "dom", "dom.iterable"],
+    "jsx": "preserve",
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "allowImportingTsExtensions": true,
+    "moduleResolution": "bundler",
+    "baseUrl": ".",
+    "types": ["node", "vite/client"],
+    "paths": {
+      "@/*": ["./client/src/*"],
+      "@shared/*": ["./shared/*"]
+    }
+  }
+}
+
+
+-------------------------------------------------------------------------------
+FILE: vite.config.ts
+-------------------------------------------------------------------------------
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+import path from "path";
+import runtimeErrorOverlay from "@replit/vite-plugin-runtime-error-modal";
+
+export default defineConfig({
+  plugins: [
+    react(),
+    runtimeErrorOverlay(),
+    ...(process.env.NODE_ENV !== "production" &&
+    process.env.REPL_ID !== undefined
+      ? [
+          await import("@replit/vite-plugin-cartographer").then((m) =>
+            m.cartographer(),
+          ),
+          await import("@replit/vite-plugin-dev-banner").then((m) =>
+            m.devBanner(),
+          ),
+        ]
+      : []),
+  ],
+  resolve: {
+    alias: {
+      "@": path.resolve(import.meta.dirname, "client", "src"),
+      "@shared": path.resolve(import.meta.dirname, "shared"),
+      "@assets": path.resolve(import.meta.dirname, "attached_assets"),
+    },
+  },
+  root: path.resolve(import.meta.dirname, "client"),
+  build: {
+    outDir: path.resolve(import.meta.dirname, "dist/public"),
+    emptyOutDir: true,
+  },
+  server: {
+    fs: {
+      strict: true,
+      deny: ["**/.*"],
+    },
+  },
+});
+
+
+-------------------------------------------------------------------------------
+FILE: tailwind.config.ts
+-------------------------------------------------------------------------------
+import type { Config } from "tailwindcss";
+
+export default {
+  darkMode: ["class"],
+  content: ["./client/index.html", "./client/src/**/*.{js,jsx,ts,tsx}"],
+  theme: {
+    extend: {
+      borderRadius: {
+        lg: ".5625rem", /* 9px */
+        md: ".375rem", /* 6px */
+        sm: ".1875rem", /* 3px */
+      },
+      colors: {
+        // Flat / base colors (regular buttons)
+        background: "hsl(var(--background) / <alpha-value>)",
+        foreground: "hsl(var(--foreground) / <alpha-value>)",
+        border: "hsl(var(--border) / <alpha-value>)",
+        input: "hsl(var(--input) / <alpha-value>)",
+        card: {
+          DEFAULT: "hsl(var(--card) / <alpha-value>)",
+          foreground: "hsl(var(--card-foreground) / <alpha-value>)",
+          border: "hsl(var(--card-border) / <alpha-value>)",
+        },
+        popover: {
+          DEFAULT: "hsl(var(--popover) / <alpha-value>)",
+          foreground: "hsl(var(--popover-foreground) / <alpha-value>)",
+          border: "hsl(var(--popover-border) / <alpha-value>)",
+        },
+        primary: {
+          DEFAULT: "hsl(var(--primary) / <alpha-value>)",
+          foreground: "hsl(var(--primary-foreground) / <alpha-value>)",
+          border: "var(--primary-border)",
+        },
+        secondary: {
+          DEFAULT: "hsl(var(--secondary) / <alpha-value>)",
+          foreground: "hsl(var(--secondary-foreground) / <alpha-value>)",
+          border: "var(--secondary-border)",
+        },
+        muted: {
+          DEFAULT: "hsl(var(--muted) / <alpha-value>)",
+          foreground: "hsl(var(--muted-foreground) / <alpha-value>)",
+          border: "var(--muted-border)",
+        },
+        accent: {
+          DEFAULT: "hsl(var(--accent) / <alpha-value>)",
+          foreground: "hsl(var(--accent-foreground) / <alpha-value>)",
+          border: "var(--accent-border)",
+        },
+        destructive: {
+          DEFAULT: "hsl(var(--destructive) / <alpha-value>)",
+          foreground: "hsl(var(--destructive-foreground) / <alpha-value>)",
+          border: "var(--destructive-border)",
+        },
+        ring: "hsl(var(--ring) / <alpha-value>)",
+        chart: {
+          "1": "hsl(var(--chart-1) / <alpha-value>)",
+          "2": "hsl(var(--chart-2) / <alpha-value>)",
+          "3": "hsl(var(--chart-3) / <alpha-value>)",
+          "4": "hsl(var(--chart-4) / <alpha-value>)",
+          "5": "hsl(var(--chart-5) / <alpha-value>)",
+        },
+        sidebar: {
+          ring: "hsl(var(--sidebar-ring) / <alpha-value>)",
+          DEFAULT: "hsl(var(--sidebar) / <alpha-value>)",
+          foreground: "hsl(var(--sidebar-foreground) / <alpha-value>)",
+          border: "hsl(var(--sidebar-border) / <alpha-value>)",
+        },
+        "sidebar-primary": {
+          DEFAULT: "hsl(var(--sidebar-primary) / <alpha-value>)",
+          foreground: "hsl(var(--sidebar-primary-foreground) / <alpha-value>)",
+          border: "var(--sidebar-primary-border)",
+        },
+        "sidebar-accent": {
+          DEFAULT: "hsl(var(--sidebar-accent) / <alpha-value>)",
+          foreground: "hsl(var(--sidebar-accent-foreground) / <alpha-value>)",
+          border: "var(--sidebar-accent-border)"
+        },
+        status: {
+          online: "rgb(34 197 94)",
+          away: "rgb(245 158 11)",
+          busy: "rgb(239 68 68)",
+          offline: "rgb(156 163 175)",
+        },
+      },
+      fontFamily: {
+        sans: ["var(--font-sans)"],
+        serif: ["var(--font-serif)"],
+        mono: ["var(--font-mono)"],
+      },
+      keyframes: {
+        "accordion-down": {
+          from: { height: "0" },
+          to: { height: "var(--radix-accordion-content-height)" },
+        },
+        "accordion-up": {
+          from: { height: "var(--radix-accordion-content-height)" },
+          to: { height: "0" },
+        },
+      },
+      animation: {
+        "accordion-down": "accordion-down 0.2s ease-out",
+        "accordion-up": "accordion-up 0.2s ease-out",
+      },
+    },
+  },
+  plugins: [require("tailwindcss-animate"), require("@tailwindcss/typography")],
+} satisfies Config;
+
+
+===============================================================================
+END OF CODEBASE EXPORT
+===============================================================================
